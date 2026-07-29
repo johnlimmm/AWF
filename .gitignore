@@ -1,0 +1,52 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local datasets and caches
+cache/
+traces/
+realtrace/
+C-/
+새 폴더/
+
+# Paper source and build products are outside this code release
+paper/
+*.aux
+*.log
+*.out
+*.err
+texput.log
+tex_build*.log
+
+# Generated binary/cache artifacts
+*.pkl
+*.pickle
+*.zip
+*.parquet
+
+# Local scratch helpers and diagnostics
+_*.py
+_*.txt
+_*.out
+heldout_*out.txt
+multihop_out.txt
+rebuild_bank.out
+results_exactrho*.log
+results_markov.log
+results_sensitivity.log
+split-audit.txt
+trace_report_out.txt
+usecase_out.txt
+
+# Large experiment output directory is staged selectively
+results/*
+!results/network-dataset-analysis/
+results/network-dataset-analysis/*
+!results/network-dataset-analysis/bci-user-results.csv
+!results/network-dataset-analysis/network-dataset-statistics.csv
+!results/network-dataset-analysis/network-delay-distributions.png
+!results/network-dataset-analysis/professor-network-dataset-report.md
+!results/network-dataset-analysis/professor-report-easy-ko.md
+!results/network-dataset-analysis/end-to-end-delay-loss-report-ko.md

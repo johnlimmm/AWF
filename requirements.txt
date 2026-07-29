@@ -1,0 +1,16 @@
+# Core scientific stack
+numpy>=1.23
+scipy>=1.10
+pandas>=1.5
+scikit-learn>=1.2
+
+# EEG / BCI stack
+mne>=1.5
+moabb>=1.0
+
+# Plotting
+matplotlib>=3.7
+seaborn>=0.12
+
+# Progress bars
+tqdm>=4.65
