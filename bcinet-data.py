@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -87,10 +88,14 @@ class UserInfo:
     n_classes: int                  # number of target classes
 
     # Test-time outputs (one entry per test trial)
-    test_posteriors: np.ndarray     # shape (n_test, n_classes), rows sum to 1
+    test_posteriors: np.ndarray     # temperature-calibrated, shape (n_test, C)
+    test_posteriors_raw: np.ndarray # uncalibrated classifier probabilities
     test_labels: np.ndarray         # shape (n_test,) integer class ids
 
     # Validation-set diagnostics
+    val_posteriors: np.ndarray      # raw validation probabilities
+    val_labels: np.ndarray          # validation labels used only for tuning
+    temperature: float              # fitted on validation NLL, fixed on test
     val_accuracy: float             # validation accuracy
     val_macro_f1: float             # validation macro-averaged F1
     confusion: np.ndarray           # row-normalized P(z=col | c=row), shape (C, C)
@@ -200,6 +205,36 @@ def _make_p300_pipeline() -> Pipeline:
 # Per-subject training
 # ---------------------------------------------------------------------------
 
+def temperature_scale(proba: np.ndarray, temperature: float,
+                      eps: float = 1e-12) -> np.ndarray:
+    """Apply scalar temperature scaling to a probability matrix.
+
+    LDA probabilities are converted back to log scores, divided by ``T``, and
+    normalized.  This preserves the predicted class while changing only the
+    confidence.  ``T`` is fitted on validation data and never on test labels.
+    """
+    p = np.asarray(proba, dtype=float)
+    logits = np.log(np.clip(p, eps, 1.0)) / float(temperature)
+    logits -= logits.max(axis=1, keepdims=True)
+    out = np.exp(logits)
+    return out / out.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(proba: np.ndarray, labels: np.ndarray) -> float:
+    """Fit one positive temperature by minimizing validation-set NLL."""
+    labels = np.asarray(labels, dtype=int)
+
+    def objective(log_t: float) -> float:
+        q = temperature_scale(proba, np.exp(log_t))
+        return -float(np.mean(np.log(np.clip(q[np.arange(len(labels)), labels],
+                                            1e-12, 1.0))))
+
+    # T in [0.05, 20] covers strong sharpening through strong softening while
+    # preventing numerically meaningless extrema on small validation folds.
+    result = minimize_scalar(objective, bounds=(np.log(0.05), np.log(20.0)),
+                             method="bounded")
+    return float(np.exp(result.x)) if result.success else 1.0
+
 def _train_one_subject(
     X: np.ndarray,
     y: np.ndarray,
@@ -248,7 +283,14 @@ def _train_one_subject(
         return None
 
     # Validation diagnostics ------------------------------------------------
-    val_pred = pipe.predict(X_va)
+    if hasattr(pipe, "predict_proba"):
+        val_proba = pipe.predict_proba(X_va)
+    else:  # pragma: no cover
+        val_pred_fallback = pipe.predict(X_va)
+        val_proba = np.eye(n_classes)[val_pred_fallback]
+    val_proba = np.clip(val_proba, 1e-9, 1.0)
+    val_proba = val_proba / val_proba.sum(axis=1, keepdims=True)
+    val_pred = np.argmax(val_proba, axis=1)
     val_acc = float(accuracy_score(y_va, val_pred))
     val_f1 = float(f1_score(y_va, val_pred, average="macro"))
 
@@ -264,23 +306,29 @@ def _train_one_subject(
 
     # Test-time posteriors ---------------------------------------------------
     if hasattr(pipe, "predict_proba"):
-        proba = pipe.predict_proba(X_te)
+        proba_raw = pipe.predict_proba(X_te)
     else:  # pragma: no cover
         # Fall back to one-hot of predictions if needed.
         preds = pipe.predict(X_te)
-        proba = np.eye(n_classes)[preds]
+        proba_raw = np.eye(n_classes)[preds]
 
     # Make sure each row is a valid distribution.
-    proba = np.clip(proba, 1e-9, 1.0)
-    proba = proba / proba.sum(axis=1, keepdims=True)
+    proba_raw = np.clip(proba_raw, 1e-9, 1.0)
+    proba_raw = proba_raw / proba_raw.sum(axis=1, keepdims=True)
+    temperature = fit_temperature(val_proba, y_va)
+    proba_cal = temperature_scale(proba_raw, temperature)
 
     return UserInfo(
         user_id="",            # filled in by caller
         dataset="",            # filled in by caller
         paradigm=paradigm_name,
         n_classes=n_classes,
-        test_posteriors=proba.astype(np.float64),
+        test_posteriors=proba_cal.astype(np.float64),
+        test_posteriors_raw=proba_raw.astype(np.float64),
         test_labels=y_te.astype(np.int64),
+        val_posteriors=val_proba.astype(np.float64),
+        val_labels=y_va.astype(np.int64),
+        temperature=temperature,
         val_accuracy=val_acc,
         val_macro_f1=val_f1,
         confusion=confusion_norm.astype(np.float64),
@@ -327,8 +375,9 @@ def build_user_pool(
     paradigm_name = DATASET_PARADIGM[dataset_name]
 
     os.makedirs(cache_dir, exist_ok=True)
+    subject_suffix = "-all" if max_subjects is None else f"-n{max_subjects}"
     cache_path = os.path.join(
-        cache_dir, f"users-{dataset_name}-seed{seed}.pkl"
+        cache_dir, f"users-{dataset_name}-seed{seed}-v2{subject_suffix}.pkl"
     )
     if (not force_rebuild) and os.path.exists(cache_path):
         with open(cache_path, "rb") as fh:
@@ -457,6 +506,8 @@ def _norm_ppf(p: float) -> float:
 def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
                       n_trials: Optional[int] = None,
                       rho_err: float = 0.0,
+                      calibrated: bool = True,
+                      split: str = "test",
                       ) -> Tuple[np.ndarray, np.ndarray]:
     """Align test trials across users and return ``(P, y)``.
 
@@ -493,6 +544,12 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
         accuracy is preserved exactly; only the cross-user error
         *correlation* changes. This isolates the effect of the committee
         independence assumption on fusion gain.
+    calibrated : bool, optional
+        Use validation-temperature-scaled test posteriors (default).  If
+        false, use the stored raw classifier probabilities on the same trials.
+    split : {``"test"``, ``"validation"``}, optional
+        Source split for collaborative-trial construction.  Validation trials
+        support policy-parameter selection; final reporting uses test trials.
 
     Returns
     -------
@@ -501,6 +558,8 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
     y : ndarray, shape (n_trials,)
         Simulated ground-truth labels.
     """
+    if split not in ("test", "validation"):
+        raise ValueError("split must be 'test' or 'validation'")
     n_classes = users[0].n_classes
     for u in users:
         if u.n_classes != n_classes:
@@ -512,9 +571,18 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
     # Per-user, per-class index lookup -------------------------------------
     per_user_idx_by_cls: List[Dict[int, np.ndarray]] = []
     common_classes: Optional[set] = None
-    for u in users:
-        d = {c: np.where(u.test_labels == c)[0] for c in range(n_classes)
-             if np.any(u.test_labels == c)}
+    label_bank = [u.test_labels if split == "test" else u.val_labels
+                  for u in users]
+    if split == "test":
+        posterior_bank = [u.test_posteriors if calibrated
+                          else u.test_posteriors_raw for u in users]
+    else:
+        posterior_bank = [temperature_scale(u.val_posteriors, u.temperature)
+                          if calibrated else u.val_posteriors for u in users]
+
+    for labels in label_bank:
+        d = {c: np.where(labels == c)[0] for c in range(n_classes)
+             if np.any(labels == c)}
         per_user_idx_by_cls.append(d)
         cls_set = set(d.keys())
         common_classes = cls_set if common_classes is None else (common_classes & cls_set)
@@ -526,7 +594,7 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
     common_classes_arr = np.array(sorted(common_classes))
 
     if n_trials is None:
-        n_trials = min(min(len(u.test_labels) for u in users), 400)
+        n_trials = min(min(len(labels) for labels in label_bank), 400)
 
     y_true = rng.choice(common_classes_arr, size=n_trials)
 
@@ -539,7 +607,7 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
                 c = int(y_true[t])
                 cand = per_user_idx_by_cls[ui][c]
                 j = cand[rng.randint(0, len(cand))]
-                P[ui, t, :] = u.test_posteriors[j]
+                P[ui, t, :] = posterior_bank[ui][j]
         return P, y_true
 
     # Correlated-error committee via shared latent trial hardness ----------
@@ -553,7 +621,7 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
         cp: Dict[int, np.ndarray] = {}
         ip: Dict[int, np.ndarray] = {}
         th: Dict[int, float] = {}
-        preds = np.argmax(u.test_posteriors, axis=1)
+        preds = np.argmax(posterior_bank[ui], axis=1)
         for c, cand in per_user_idx_by_cls[ui].items():
             ok = cand[preds[cand] == c]
             bad = cand[preds[cand] != c]
@@ -579,5 +647,5 @@ def align_test_trials(users: List[UserInfo], rng: np.random.RandomState,
             else:
                 pool = correct_pool[ui][c]
             j = pool[rng.randint(0, len(pool))]
-            P[ui, t, :] = u.test_posteriors[j]
+            P[ui, t, :] = posterior_bank[ui][j]
     return P, y_true

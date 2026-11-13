@@ -31,7 +31,10 @@ Each subject is treated as one BCI user. EEG is band-pass filtered at
 8-30 Hz, represented with six CSP components, and classified with shrinkage
 LDA. Each subject is split into approximately 56% training, 14% validation,
 and 30% test data. Validation data estimates user reliability and confusion
-matrices; held-out test posteriors are used only for final fusion evaluation.
+matrices and fits one scalar posterior temperature per user. The fitted
+temperature is then frozen and applied to held-out test posteriors; raw test
+posteriors are retained for the calibration ablation. Held-out test labels are
+used only for final evaluation.
 
 Because these datasets are not simultaneous multi-user recordings,
 class-matched held-out trials from different subjects are combined to create
@@ -50,6 +53,11 @@ Wi-Fi and 5G loss is inferred from missing probes in the nominal 10 ms probe
 cadence. LTE uses the source `PINGLOSS` field. LEO loss is inferred from
 missing IRTT sequence numbers.
 
+The LTE tier keeps only UCC rows with `NetworkMode == "LTE"`. HSPA/UMTS/EDGE
+fallback rows are excluded so the sample definition matches the 4G-LTE label.
+The trace-bank cache carries a schema version and is rebuilt automatically if
+this source definition changes.
+
 The main experiment independently bootstraps per-response delays from each
 access tier's empirical CDF and applies its measured mean loss probability.
 The replay experiment instead consumes ordered trace segments to preserve
@@ -67,7 +75,9 @@ bank are intentionally not stored in Git.
 | `bcinet-metrics.py` | accuracy, latency, response-use, and stopping metrics |
 | `run-bcinet-experiment.py` | common experiment runner |
 | `run-accesstier.py` | main, frontier, arrival-belief, NTN, deadline, and replay experiments |
+| `run-iotj-revision.py` | isolated major-revision calibration, tuning, ablation, significance, and DP experiments |
 | `plot-accesstier.py` | access-tier result plots |
+| `test_revision_invariants.py` | deterministic policy-endpoint and ablation regression tests |
 | `analyze_new_network_datasets.py` | network trace statistics and CDF/deadline plots |
 
 Additional `run_*.py` scripts contain robustness checks for held-out trace
@@ -125,6 +135,40 @@ Generate the main figures:
 
 ```bash
 python plot-accesstier.py
+```
+
+Run the isolated IoTJ revision campaign (results are written under
+`results/iotj-revision-v1/` with a manifest):
+
+```bash
+python run-iotj-revision.py --only trace calibration tuning ablation dp heldout homogeneous runtime
+```
+
+For each dataset, First-k, Confidence-Stop, Anytime-cBCI, Arrival-Only,
+Throughput-Stop, Entropy-Gain, and AWF control parameters are selected using
+collaborative trials constructed only from the validation split. Every method
+minimizes the same validation objective
+`1 - accuracy + 1e-3 * mean_latency_ms`; the selected value is frozen before
+held-out test evaluation. The runner also writes trial-level paired records,
+exact McNemar tests for accuracy, and paired Wilcoxon tests for latency.
+
+The `dp` experiment compares AWF with an exact Bellman solution of a
+time-discretized finite-horizon model on Zhou2016 (four users). The DP
+integrates every possible future arrival subset and confusion-matrix report;
+it does not observe realized future delays, posteriors, or labels. It is an
+approximation-gap reference, not a scalable online baseline.
+
+The `heldout` experiment estimates both delay and loss beliefs on the first
+half of each tier's preserved sequences and replays the second half in order.
+It includes a shared-link stress in which users on the same access experience
+the same spikes and loss events. The `homogeneous` experiment assigns every
+committee member to Wi-Fi, 5G, LTE, or LEO in turn. `runtime` reports a
+worst-case user-scaling benchmark and policy-state memory.
+
+Run the deterministic revision checks before a long campaign:
+
+```bash
+python -m unittest -v test_revision_invariants.py
 ```
 
 Recalculate the network dataset summary:

@@ -164,6 +164,22 @@ class NetworkProfile:
     state: Optional[str] = None
     est_samples: Optional[np.ndarray] = None
     est_loss: float = 0.0
+    # Prefix sums of sorted est_samples enable exact truncated residual-delay
+    # expectations in O(log S) rather than scanning all S trace samples at
+    # every policy event.  Filled automatically and excluded from repr.
+    est_prefix_sum: Optional[np.ndarray] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.est_samples is not None:
+            samples = np.asarray(self.est_samples, dtype=np.float64)
+            if not samples.size:
+                self.est_samples = samples
+                return
+            if samples.size > 1 and np.any(samples[1:] < samples[:-1]):
+                samples = np.sort(samples)
+            self.est_samples = samples
+            self.est_prefix_sum = np.concatenate(
+                ([0.0], np.cumsum(samples, dtype=np.float64)))
 
 
 def _sample_in_range(rng: np.random.RandomState,
@@ -902,18 +918,29 @@ def expected_remaining_delay(profile: NetworkProfile,
     samples = profile.est_samples
     if samples is not None and samples.size:
         samples = np.asarray(samples, dtype=float)
-        surviving = samples[samples > t]
+        n = samples.size
+        first = int(np.searchsorted(samples, t, side="right"))
+        before_deadline = int(np.searchsorted(
+            samples, t + remaining, side="right"))
+        surviving_count = n - first
         loss = float(np.clip(profile.est_loss, 0.0, 1.0))
         p_link = 1.0 - loss
-        survival_fraction = float(surviving.size) / float(samples.size)
+        survival_fraction = float(surviving_count) / float(n)
         denominator = loss + p_link * survival_fraction
         if denominator <= 1e-12:
             return 0.0
 
         observed_mass = 0.0
-        if surviving.size:
-            observed_mass = p_link * survival_fraction * float(
-                np.mean(np.minimum(surviving - t, remaining)))
+        if surviving_count:
+            prefix = profile.est_prefix_sum
+            if prefix is None:  # compatibility with unusually constructed objects
+                prefix = np.concatenate(([0.0], np.cumsum(samples)))
+            finite_count = before_deadline - first
+            finite_sum = float(prefix[before_deadline] - prefix[first])
+            beyond_count = n - before_deadline
+            truncated_sum = (finite_sum - t * finite_count
+                             + remaining * beyond_count)
+            observed_mass = p_link * truncated_sum / float(n)
         return float((observed_mass + loss * remaining) / denominator)
 
     d_lo, d_hi = profile.delay_range

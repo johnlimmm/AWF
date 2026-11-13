@@ -67,10 +67,12 @@ MAIN_METHODS = [
 KEY_METHODS = ["weighted", "logpool", "fastest_only", "earliest_k:3",
                "anytime_cbci", "anytime_cbci_cw", "da_os", "deadline_partial",
                "deadline_aware", "generic_voi", "neurobci_sc", "awf", "oracle"]
-AWF_LAMBDAS = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
-ANYTIME_THETAS = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
-DEADLINE_TAUS = [0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01]
-DA_OS_BETAS = [1e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1e3]
+AWF_LAMBDAS = [0.0, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3,
+               1e-2, 3e-2, 1e-1]
+ANYTIME_THETAS = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0]
+DEADLINE_TAUS = [0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.0]
+DA_OS_BETAS = [0.0, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0, 3.0,
+               10.0, 30.0, 100.0, 300.0, 1e3]
 
 # Unified operating point.  Both the margin-scale alpha and the delay-cost
 # lambda default to 1e-3.  The sensitivity sweeps below vary one knob at a
@@ -156,6 +158,19 @@ def exp_frontier() -> None:
                                             lambda_delay=DEFAULT_LAMBDA)
                 row = {"dataset": dataset, "seed": seed, "method": meth,
                        "sweep": np.nan,
+                       "accuracy": metrics.accuracy(res, y)}
+                row.update(_pct_latencies(res))
+                rows.append(row)
+            # First-k frontier.  Sweep every feasible committee size rather
+            # than reporting only the favorable k=3 operating point.
+            for k in range(1, len(users) + 1):
+                res, arr, y, nu = R.run_one("earliest_k:%d" % k, seed,
+                                            dataset, preset, users,
+                                            deadline_ms=50.0,
+                                            alpha=DEFAULT_ALPHA,
+                                            lambda_delay=DEFAULT_LAMBDA)
+                row = {"dataset": dataset, "seed": seed,
+                       "method": "earliest_k", "sweep": k,
                        "accuracy": metrics.accuracy(res, y)}
                 row.update(_pct_latencies(res))
                 rows.append(row)

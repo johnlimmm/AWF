@@ -44,8 +44,10 @@ interpretable adaptive waiting policy.
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -512,8 +514,11 @@ def deadline_aware_waiting(P: np.ndarray, arrivals_ms: np.ndarray,
         t = float(arrivals_ms[i])
         arrived_set = set(arrived)
         missing = [j for j in range(n_users) if j not in arrived_set]
+        # Strict inequality gives the intended endpoint: tau=0 waits only for
+        # users that retain a non-zero chance of arriving by D, rather than
+        # treating an impossible arrival (rho=0) as "likely".
         still_likely = any(
-            arrival_probability(profiles[j], t, deadline_ms) >= tau
+            arrival_probability(profiles[j], t, deadline_ms) > tau
             for j in missing)
         if not still_likely:
             q = _logpool(P[arrived], eps=eps)
@@ -829,12 +834,15 @@ def awf_fusion(P: np.ndarray, arrivals_ms: np.ndarray,
                deadline_ms: float,
                profiles: Sequence[NetworkProfile],
                confusions: Sequence[np.ndarray],
+               val_acc: Optional[np.ndarray] = None,
                alpha: float = 1e-3,
                lambda_delay: float = 1e-3,
                eps: float = EPS,
                use_delay_cost: bool = True,
                use_reliability: bool = True,
+               reliability_model: str = "confusion",
                use_arrival_prob: bool = True,
+               use_margin: bool = True,
                exact_arrival: bool = False,
                pred_pool: str = "log",
                **_) -> TrialResult:
@@ -859,9 +867,14 @@ def awf_fusion(P: np.ndarray, arrivals_ms: np.ndarray,
     Ablation flags
     --------------
     use_delay_cost : if False, drop the lambda_delay term (AWF w/o delay cost).
-    use_reliability : if False, replace each P_i with a uniform-on-correct
-        confusion matrix (= mean accuracy on diagonal) -> AWF w/o reliability.
+    use_reliability : if False, replace each confusion matrix with a completely
+        uninformative matrix -> AWF w/o reliability.
+    reliability_model : ``"confusion"`` uses the full class-conditional
+        confusion matrix. ``"accuracy"`` retains only each user's scalar
+        validation accuracy, placing it on the diagonal and spreading the
+        remaining probability uniformly off-diagonal.
     use_arrival_prob : if False, set rho_i(t) = 1 -> AWF w/o arrival prob.
+    use_margin : if False, disable the sufficient-margin safety valve.
     exact_arrival : if True, replace the linear rho approximation with the
         exact Bayes-updated conditional arrival probability
         ``P(t < a_i <= D | a_i > t)`` derived from the true sampling
@@ -884,15 +897,27 @@ def awf_fusion(P: np.ndarray, arrivals_ms: np.ndarray,
     order = np.argsort(arrivals_ms)
     order = [i for i in order if finite_mask[i]]
 
-    # Optional reliability-ablation: uniform confusion matrices --------------
-    if use_reliability:
+    # Reliability representations -------------------------------------------
+    if not use_reliability:
+        # Every row is uniform: the missing report conveys no class-specific
+        # predictive information in the one-step risk model.
+        uniform_conf = np.full((n_classes, n_classes), 1.0 / n_classes)
+        conf_list = [uniform_conf.copy() for _ in confusions]
+    elif reliability_model == "confusion":
         conf_list = list(confusions)
+    elif reliability_model == "accuracy":
+        if val_acc is None or len(val_acc) != n_users:
+            raise ValueError("reliability_model='accuracy' requires one "
+                             "validation accuracy per user")
+        conf_list = []
+        for a in np.asarray(val_acc, dtype=float):
+            a = float(np.clip(a, 0.0, 1.0))
+            off = (1.0 - a) / max(n_classes - 1, 1)
+            c = np.full((n_classes, n_classes), off, dtype=float)
+            np.fill_diagonal(c, a)
+            conf_list.append(c)
     else:
-        diag = 1.0 / n_classes
-        # Construct an "uninformative-but-still-row-normalized" matrix.
-        uniform_conf = np.full((n_classes, n_classes), (1.0 - diag) / max(n_classes - 1, 1))
-        np.fill_diagonal(uniform_conf, diag)
-        conf_list = [uniform_conf for _ in confusions]
+        raise ValueError("unknown reliability_model %r" % reliability_model)
 
     arrived: List[int] = []
     waiting_values: List[float] = []
@@ -930,7 +955,7 @@ def awf_fusion(P: np.ndarray, arrivals_ms: np.ndarray,
         L_sorted = np.sort(L)[::-1]
         margin = float(L_sorted[0] - L_sorted[1]) if n_classes >= 2 else np.inf
 
-        if margin >= A_thresh:
+        if use_margin and margin >= A_thresh:
             used = np.zeros(n_users, dtype=bool)
             used[arrived] = True
             return TrialResult(
@@ -1014,6 +1039,191 @@ def awf_fusion(P: np.ndarray, arrivals_ms: np.ndarray,
                 "mean_waited_rho": float(np.mean(waited_rhos)) if waited_rhos else 0.0,
                 "arrival_count": float(len(arrived))},
     )
+
+
+# ---------------------------------------------------------------------------
+# Finite-horizon dynamic-programming reference (small committees only)
+# ---------------------------------------------------------------------------
+
+def dp_optimal_stopping(P: np.ndarray, arrivals_ms: np.ndarray,
+                        deadline_ms: float,
+                        profiles: Sequence[NetworkProfile],
+                        confusions: Sequence[np.ndarray],
+                        lambda_delay: float = 1e-3,
+                        grid_ms: float = 5.0,
+                        eps: float = EPS,
+                        max_users: int = 6,
+                        **_) -> TrialResult:
+    """Exact Bellman solution of a time-discretized stopping model.
+
+    This is a non-clairvoyant reference for quantifying AWF's one-step
+    approximation gap on small committees.  At an observed arrival event, the
+    state is ``(current class belief, missing-user set, time)``.  Over each
+    interval, every missing user's arrival hazard is obtained from its
+    conditional empirical CDF.  For any users arriving in that interval, all
+    combinations of hard reports are integrated with their validation
+    confusion matrices.  The Bellman recursion minimizes
+
+        misclassification risk + lambda_delay * additional waiting time.
+
+    Thus every future arrival subset and report sequence is enumerated; no
+    realized future delay, posterior, or true label is exposed to the policy.
+    The solution is exact for the chosen ``grid_ms`` discretization and the
+    same conditional-independence model used by AWF.  Complexity is
+    exponential in committee size, so the method is intentionally restricted
+    to small-N validation (principally Zhou2016 with N=4), not proposed as an
+    online replacement for AWF.
+    """
+    n_users, n_classes = P.shape
+    if n_users > max_users:
+        raise ValueError("dp_optimal is restricted to at most %d users" % max_users)
+    if grid_ms <= 0:
+        raise ValueError("grid_ms must be positive")
+    finite_mask = _arrived_mask(arrivals_ms, deadline_ms)
+    if not finite_mask.any():
+        return _empty_decision(n_classes, deadline_ms, n_users)
+    order = [i for i in np.argsort(arrivals_ms) if finite_mask[i]]
+    conf_list = [np.asarray(c, dtype=float) for c in confusions]
+    arrived: List[int] = []
+
+    def _belief(idx: Sequence[int]) -> np.ndarray:
+        scores = np.sum(np.log(np.clip(P[list(idx)], eps, 1.0)), axis=0)
+        scores -= scores.max()
+        q = np.exp(scores)
+        return q / q.sum()
+
+    def _bellman(q0: np.ndarray, missing0: Tuple[int, ...], t0: float
+                 ) -> Tuple[float, float]:
+        """Return (stop value, continue value) at one observed event."""
+        # Include the exact event time, then the next global grid boundary and
+        # all remaining boundaries through D.
+        next_boundary = (np.floor(t0 / grid_ms) + 1.0) * grid_ms
+        tail = np.arange(next_boundary, deadline_ms, grid_ms, dtype=float)
+        times = np.concatenate(([float(t0)], tail, [float(deadline_ms)]))
+        times = np.unique(np.clip(times, t0, deadline_ms))
+
+        @lru_cache(maxsize=None)
+        def value(q_key: Tuple[float, ...], missing: Tuple[int, ...],
+                  k: int) -> float:
+            q = np.asarray(q_key, dtype=float)
+            q = q / q.sum()
+            stop = 1.0 - float(q.max())
+            if not missing or k >= len(times) - 1:
+                return stop
+
+            ta, tb = float(times[k]), float(times[k + 1])
+            hazards = {
+                j: float(np.clip(arrival_probability_empirical(
+                    profiles[j], ta, tb), 0.0, 1.0))
+                for j in missing
+            }
+            continuation = lambda_delay * (tb - ta)
+            expected_future = 0.0
+
+            # Arrival subsets are independent conditional on the trace model.
+            for mask in range(1 << len(missing)):
+                arrived_now = tuple(
+                    missing[pos] for pos in range(len(missing))
+                    if mask & (1 << pos))
+                p_subset = 1.0
+                for pos, j in enumerate(missing):
+                    h = hazards[j]
+                    p_subset *= h if mask & (1 << pos) else (1.0 - h)
+                if p_subset <= 1e-15:
+                    continue
+                remaining = tuple(j for j in missing if j not in arrived_now)
+                if not arrived_now:
+                    expected_future += p_subset * value(
+                        tuple(np.round(q, 12)), remaining, k + 1)
+                    continue
+
+                # Reports share the same latent class.  Their joint likelihood
+                # is prod_j F_j[c,z_j], integrated over the current belief.
+                for reports in itertools.product(range(n_classes),
+                                                 repeat=len(arrived_now)):
+                    likelihood = np.ones(n_classes, dtype=float)
+                    for j, z in zip(arrived_now, reports):
+                        likelihood *= conf_list[j][:, z]
+                    p_reports = float(np.dot(q, likelihood))
+                    if p_reports <= 1e-15:
+                        continue
+                    q_next = q * likelihood
+                    q_next /= q_next.sum()
+                    expected_future += p_subset * p_reports * value(
+                        tuple(np.round(q_next, 12)), remaining, k + 1)
+
+            continuation += expected_future
+            return min(stop, continuation)
+
+        stop0 = 1.0 - float(q0.max())
+        if not missing0 or len(times) < 2:
+            return stop0, np.inf
+
+        # Reproduce the first Bellman continuation explicitly so the caller
+        # can inspect the stop/continue comparison at the observed event.
+        ta, tb = float(times[0]), float(times[1])
+        hazards = {j: float(np.clip(arrival_probability_empirical(
+            profiles[j], ta, tb), 0.0, 1.0)) for j in missing0}
+        cont0 = lambda_delay * (tb - ta)
+        future0 = 0.0
+        for mask in range(1 << len(missing0)):
+            arrived_now = tuple(missing0[pos] for pos in range(len(missing0))
+                                if mask & (1 << pos))
+            p_subset = 1.0
+            for pos, j in enumerate(missing0):
+                h = hazards[j]
+                p_subset *= h if mask & (1 << pos) else (1.0 - h)
+            if p_subset <= 1e-15:
+                continue
+            remaining = tuple(j for j in missing0 if j not in arrived_now)
+            if not arrived_now:
+                future0 += p_subset * value(tuple(np.round(q0, 12)),
+                                             remaining, 1)
+                continue
+            for reports in itertools.product(range(n_classes),
+                                             repeat=len(arrived_now)):
+                likelihood = np.ones(n_classes, dtype=float)
+                for j, z in zip(arrived_now, reports):
+                    likelihood *= conf_list[j][:, z]
+                p_reports = float(np.dot(q0, likelihood))
+                if p_reports <= 1e-15:
+                    continue
+                q_next = q0 * likelihood
+                q_next /= q_next.sum()
+                future0 += p_subset * p_reports * value(
+                    tuple(np.round(q_next, 12)), remaining, 1)
+        return stop0, cont0 + future0
+
+    last_values = (np.nan, np.nan)
+    for i in order:
+        arrived.append(i)
+        t = float(arrivals_ms[i])
+        q = _belief(arrived)
+        missing = tuple(j for j in range(n_users) if j not in set(arrived))
+        if not missing:
+            used = np.zeros(n_users, dtype=bool)
+            used[arrived] = True
+            return TrialResult(pred=int(q.argmax()), decision_time_ms=t,
+                               used_mask=used, stopping_reason="all_arrived")
+        stop_v, continue_v = _bellman(q, missing, t)
+        last_values = (stop_v, continue_v)
+        if stop_v <= continue_v + 1e-12:
+            used = np.zeros(n_users, dtype=bool)
+            used[arrived] = True
+            return TrialResult(
+                pred=int(q.argmax()), decision_time_ms=t, used_mask=used,
+                stopping_reason="dp_stop",
+                extras={"dp_stop_value": stop_v,
+                        "dp_continue_value": continue_v})
+
+    q = _belief(arrived)
+    used = np.zeros(n_users, dtype=bool)
+    used[arrived] = True
+    return TrialResult(
+        pred=int(q.argmax()), decision_time_ms=deadline_ms, used_mask=used,
+        stopping_reason="deadline",
+        extras={"dp_stop_value": float(last_values[0]),
+                "dp_continue_value": float(last_values[1])})
 
 
 # ---------------------------------------------------------------------------
@@ -1181,7 +1391,7 @@ def get_method(name: str) -> Callable[..., TrialResult]:
     Names that include a parameter use ``method:param`` syntax, e.g.
     ``"earliest_k:3"`` or ``"reliability_top_k:5"``. AWF ablations are
     accessed as ``"awf"`` (full), ``"awf_no_delay"``, ``"awf_no_reliability"``,
-    ``"awf_no_arrival"``.
+    ``"awf_accuracy_only"``, ``"awf_no_arrival"``, and ``"awf_no_margin"``.
     """
     base = name.split(":")[0]
     parts = name.split(":")
@@ -1239,6 +1449,9 @@ def get_method(name: str) -> Callable[..., TrialResult]:
 
     if base == "oracle":
         return oracle_best_stopping
+    if base == "dp_optimal":
+        grid = float(param) if param else 5.0
+        return lambda *a, **kw: dp_optimal_stopping(*a, grid_ms=grid, **kw)
 
     if base == "awf":
         return awf_fusion
@@ -1246,8 +1459,13 @@ def get_method(name: str) -> Callable[..., TrialResult]:
         return lambda *a, **kw: awf_fusion(*a, use_delay_cost=False, **kw)
     if base == "awf_no_reliability":
         return lambda *a, **kw: awf_fusion(*a, use_reliability=False, **kw)
+    if base == "awf_accuracy_only":
+        return lambda *a, **kw: awf_fusion(
+            *a, reliability_model="accuracy", **kw)
     if base == "awf_no_arrival":
         return lambda *a, **kw: awf_fusion(*a, use_arrival_prob=False, **kw)
+    if base == "awf_no_margin":
+        return lambda *a, **kw: awf_fusion(*a, use_margin=False, **kw)
     if base == "awf_linear":
         return lambda *a, **kw: awf_fusion(*a, pred_pool="linear", **kw)
     if base == "awf_exact":

@@ -50,13 +50,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TRACES = os.path.join(HERE, "traces")
 BANK_PATH = os.path.join(TRACES, "tracebank.pkl")
 
+# Increment whenever a source filter or the cached representation changes.
+# Loading an older bank silently would mix results produced from different
+# trace definitions (notably the pre-revision cellular bank, which also folded
+# HSPA/UMTS fallback rows into the tier labelled "4G-LTE").
+TRACEBANK_SCHEMA_VERSION = 3
+
 TIER_ORDER = ["wifi", "5g", "lte", "leo"]
 
-#: RAT labels (UCC ``NetworkMode``) folded into the 4G-LTE tier: 4G-LTE plus any
-#: legacy fall-back (HSPA+/HSDPA/UMTS/...) the handset dropped to while out of 5G
-#: coverage, so the tier carries the realistic heavy tail of degraded cellular.
-CELL_LTE_MODES = {"LTE", "HSPA+", "HSPA", "HSUPA", "HSDPA", "UMTS",
-                  "EDGE", "GPRS"}
+#: The paper labels this tier 4G-LTE, so retain only rows whose measured radio
+#: access technology is explicitly LTE.  Legacy 3G/2G fallback modes are not
+#: pooled into this tier.
+CELL_LTE_MODES = {"LTE"}
 
 # ---------------------------------------------------------------------------
 # IRTT true-uplink-OWD source paths (Wi-Fi / 5G KTH wireless-pr3d parquet, LEO
@@ -94,6 +99,7 @@ class TierBank:
     delay_by_state: Dict[str, np.ndarray]         # one-way delay samples (ms)
     loss_by_state: Dict[str, float]               # loss prob per state
     sequences: List[np.ndarray] = field(default_factory=list)  # per-source ordered one-way delays (ms)
+    sequence_losses: List[float] = field(default_factory=list)  # aligned per-sequence loss rates
 
     def overall_loss(self) -> float:
         return float(np.dot(self.state_probs,
@@ -122,6 +128,7 @@ def _irtt_parquet_tier(files: Sequence[str], rng: np.random.RandomState,
     """
     pool: List[np.ndarray] = []
     seqs: List[np.ndarray] = []
+    seq_losses: List[float] = []
     tot_recv = 0
     tot_missed = 0
     for fp in sorted(files):
@@ -144,6 +151,7 @@ def _irtt_parquet_tier(files: Sequence[str], rng: np.random.RandomState,
         gaps = gaps[gaps > 0]
         expected = np.maximum(np.round(gaps / IRTT_INTERVAL_NS).astype(np.int64), 1)
         missed = int(np.sum(expected - 1))
+        file_loss = missed / max(int(sd.size) + missed, 1)
         tot_recv += int(sd.size)
         tot_missed += missed
         # Pooled marginal (for the empirical CDF belief).
@@ -152,8 +160,10 @@ def _irtt_parquet_tier(files: Sequence[str], rng: np.random.RandomState,
         n_full = sd.size // SEQ_CHUNK
         for c in range(n_full):
             seqs.append(sd[c * SEQ_CHUNK:(c + 1) * SEQ_CHUNK].astype(np.float32))
+            seq_losses.append(float(file_loss))
         if n_full == 0:
             seqs.append(sd.astype(np.float32))
+            seq_losses.append(float(file_loss))
     if not pool:
         d_all = np.asarray([fallback_ms], dtype=np.float32)
         return TierBank(states=["nominal"], state_probs=np.array([1.0]),
@@ -167,12 +177,14 @@ def _irtt_parquet_tier(files: Sequence[str], rng: np.random.RandomState,
     if len(seqs) > MAX_SEQS:
         keep = rng.choice(len(seqs), MAX_SEQS, replace=False)
         seqs = [seqs[i] for i in np.sort(keep)]
+        seq_losses = [seq_losses[i] for i in np.sort(keep)]
     return TierBank(
         states=["nominal"],
         state_probs=np.array([1.0]),
         delay_by_state={"nominal": d_all},
         loss_by_state={"nominal": float(loss)},
         sequences=seqs,
+        sequence_losses=seq_losses,
     )
 
 
@@ -202,9 +214,9 @@ def _parse_lte(rng: np.random.RandomState) -> TierBank:
     """Build the 4G-LTE tier from the UCC measured ping logs.
 
     The UCC ``5G`` dataset logs every sample's radio-access technology in
-    ``NetworkMode``.  We keep the 4G-LTE rows (LTE plus any legacy fall-back
-    the handset dropped to while out of 5G coverage, which carries the
-    realistic heavy tail of degraded cellular).  The measured ``PINGAVG/2``
+    ``NetworkMode``.  We keep only rows explicitly labelled ``LTE``; older
+    HSPA/UMTS/EDGE fallback modes are excluded so the source filter matches
+    the tier name used in the paper.  The measured ``PINGAVG/2``
     one-way delays and ``PINGLOSS`` are used directly as a single measured
     access state.  This is the only tier that uses a half-RTT rather than a
     true IRTT uplink one-way delay, because no accessible packet-level LTE
@@ -216,11 +228,13 @@ def _parse_lte(rng: np.random.RandomState) -> TierBank:
     delays: List[float] = []
     loss: List[float] = []
     seqs: List[np.ndarray] = []
+    seq_losses: List[float] = []
     for fp in files:
         try:
             with open(fp, encoding="utf-8", errors="replace") as f:
                 r = csv.DictReader(f)
                 cur: List[float] = []
+                cur_loss: List[float] = []
                 for row in r:
                     nm = (row.get("NetworkMode") or "").strip()
                     if nm not in CELL_LTE_MODES:
@@ -239,21 +253,28 @@ def _parse_lte(rng: np.random.RandomState) -> TierBank:
                     pl = row.get("PINGLOSS", "-")
                     try:
                         v = float(pl)
-                        loss.append(v / 100.0 if v > 1.0 else v)
+                        loss_value = v / 100.0 if v > 1.0 else v
+                        loss.append(loss_value)
+                        cur_loss.append(loss_value)
                     except (TypeError, ValueError):
                         pass
                 if len(cur) >= 4:
                     seqs.append(np.asarray(cur, dtype=np.float32))
+                    seq_losses.append(float(np.mean(cur_loss))
+                                      if cur_loss else np.nan)
         except Exception:
             continue
     d = np.asarray(delays or [45.0], dtype=np.float32)
     loss_mean = float(np.mean(loss)) if loss else 0.02
+    seq_losses = [loss_mean if not np.isfinite(x) else float(x)
+                  for x in seq_losses]
     return TierBank(
         states=["nominal"],
         state_probs=np.array([1.0]),
         delay_by_state={"nominal": d},
         loss_by_state={"nominal": loss_mean},
         sequences=seqs[:MAX_SEQS],
+        sequence_losses=seq_losses[:MAX_SEQS],
     )
 
 
@@ -278,6 +299,7 @@ def _parse_leo(rng: np.random.RandomState) -> TierBank:
     """
     pool: List[np.ndarray] = []
     seqs: List[np.ndarray] = []
+    seq_losses: List[float] = []
     tot_recv = 0
     tot_missed = 0
     if not os.path.exists(LEO_IRTT_ZIP):
@@ -290,6 +312,7 @@ def _parse_leo(rng: np.random.RandomState) -> TierBank:
         for m in sorted(members):
             sd_list: List[float] = []
             last_seq = -1
+            session_missed = 0
             n_lines = 0
             with z.open(m) as f:
                 for raw in f:
@@ -306,19 +329,24 @@ def _parse_leo(rng: np.random.RandomState) -> TierBank:
                     if not (0.0 < val < 60000.0):
                         continue
                     if last_seq >= 0 and seq > last_seq:
-                        tot_missed += (seq - last_seq - 1)
+                        gap_missed = seq - last_seq - 1
+                        tot_missed += gap_missed
+                        session_missed += gap_missed
                     last_seq = seq
                     sd_list.append(val)
             if len(sd_list) < 8:
                 continue
             sd = np.asarray(sd_list, dtype=np.float32)
+            session_loss = session_missed / max(sd.size + session_missed, 1)
             tot_recv += sd.size
             pool.append(sd)
             n_full = sd.size // SEQ_CHUNK
             for c in range(n_full):
                 seqs.append(sd[c * SEQ_CHUNK:(c + 1) * SEQ_CHUNK])
+                seq_losses.append(float(session_loss))
             if n_full == 0:
                 seqs.append(sd)
+                seq_losses.append(float(session_loss))
     if not pool:
         d = np.asarray([30.0], dtype=np.float32)
         return TierBank(states=["nominal"], state_probs=np.array([1.0]),
@@ -332,12 +360,14 @@ def _parse_leo(rng: np.random.RandomState) -> TierBank:
     if len(seqs) > MAX_SEQS:
         keep = rng.choice(len(seqs), MAX_SEQS, replace=False)
         seqs = [seqs[i] for i in np.sort(keep)]
+        seq_losses = [seq_losses[i] for i in np.sort(keep)]
     return TierBank(
         states=["nominal"],
         state_probs=np.array([1.0]),
         delay_by_state={"nominal": d_all},
         loss_by_state={"nominal": float(loss)},
         sequences=seqs,
+        sequence_losses=seq_losses,
     )
 
 
@@ -353,6 +383,7 @@ def _to_plain(bank: Dict[str, TierBank]) -> dict:
         "delay_by_state": {s: np.asarray(v) for s, v in b.delay_by_state.items()},
         "loss_by_state": {s: float(v) for s, v in b.loss_by_state.items()},
         "sequences": [np.asarray(x) for x in b.sequences],
+        "sequence_losses": [float(x) for x in b.sequence_losses],
     } for t, b in bank.items()}
 
 
@@ -364,11 +395,11 @@ def _from_plain(d: dict) -> Dict[str, TierBank]:
         delay_by_state={s: np.asarray(a) for s, a in v["delay_by_state"].items()},
         loss_by_state={s: float(x) for s, x in v["loss_by_state"].items()},
         sequences=[np.asarray(x) for x in v["sequences"]],
+        sequence_losses=[float(x) for x in v.get("sequence_losses", [])],
     ) for t, v in d.items()}
 
 
 def build_tracebank(seed: int = 0,
-                    ble_max_rows: Optional[int] = None,
                     verbose: bool = True) -> Dict[str, TierBank]:
     """Parse all raw datasets into a tier->TierBank dict and cache it."""
     rng = np.random.RandomState(seed)
@@ -386,7 +417,8 @@ def build_tracebank(seed: int = 0,
         print("[tracebank] parsing LEO Starlink IRTT uplink OWD (Casparsen) ...")
     bank["leo"] = _parse_leo(rng)
     with open(BANK_PATH, "wb") as f:
-        pickle.dump(_to_plain(bank), f)
+        pickle.dump({"schema_version": TRACEBANK_SCHEMA_VERSION,
+                     "bank": _to_plain(bank)}, f)
     if verbose:
         _print_summary(bank)
     return bank
@@ -404,7 +436,14 @@ def load_tracebank() -> Dict[str, TierBank]:
         _BANK_CACHE = build_tracebank()
         return _BANK_CACHE
     with open(BANK_PATH, "rb") as f:
-        _BANK_CACHE = _from_plain(pickle.load(f))
+        cached = pickle.load(f)
+    if (not isinstance(cached, dict)
+            or cached.get("schema_version") != TRACEBANK_SCHEMA_VERSION
+            or "bank" not in cached):
+        print("[tracebank] cache definition changed; rebuilding ...")
+        _BANK_CACHE = build_tracebank()
+        return _BANK_CACHE
+    _BANK_CACHE = _from_plain(cached["bank"])
     return _BANK_CACHE
 
 
@@ -425,8 +464,6 @@ def _print_summary(bank: Dict[str, TierBank]) -> None:
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--ble-max-rows", type=int, default=None,
-                   help="cap BLE rows parsed (smoke test)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    build_tracebank(seed=args.seed, ble_max_rows=args.ble_max_rows)
+    build_tracebank(seed=args.seed)

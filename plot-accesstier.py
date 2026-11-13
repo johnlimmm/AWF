@@ -49,6 +49,7 @@ METHOD_LABEL = {"weighted": "Full-Wait (linear)", "fastest_only": "First-Arrival
                 "neurobci_sc": "Full-wait SC", "deadline_aware": "Arrival-Only",
                 "generic_voi": "Entropy-Gain", "logpool": "Full-Wait"}
 CLR = {"awf": "#d1495b", "anytime_cbci": "#e8a33d", "earliest_k:3": "#3fa34d",
+       "earliest_k": "#3fa34d",
        "weighted": "#6c757d", "fastest_only": "#e8a33d", "oracle": "#8134af",
        "neurobci_sc": "#1b998b", "deadline_aware": "#5c4d7d",
        "generic_voi": "#c9a227", "logpool": "#1b998b",
@@ -146,17 +147,25 @@ def fig_main():
 def fig_frontier():
     f = _load("table-frontier.csv")
     # methods whose control knob is swept -> draw one operating-point curve
-    swept = [("deadline_aware", "Arrival-Only", "tau", "--"),
+    swept = [("earliest_k", "First-k", "k", (0, (1, 1))),
+             ("deadline_aware", "Arrival-Only", "tau", "--"),
+             ("anytime_cbci", "Confidence-Stop", "theta", (0, (5, 1))),
              ("anytime_cbci_cw", "Anytime-cBCI", "theta", ":"),
              ("da_os", "Throughput-Stop", "beta", (0, (3, 1, 1, 1))),
              ("generic_voi", "Entropy-Gain", "lambda", "-."),
              ("awf", "AWF", "lambda", "-")]
 
     def _rng(sym, v_a, v_b):
+        if sym == "k":
+            return r"$k\!\in\![%d,%d]$" % (int(v_a), int(v_b))
         if sym == "lambda":
+            if v_a <= 0:
+                return r"$\lambda\!\in\![0,10^{%d}]$" % int(round(np.log10(v_b)))
             return r"$\lambda\!\in\![10^{%d},10^{%d}]$" % (
                 int(round(np.log10(v_a))), int(round(np.log10(v_b))))
         if sym == "beta":
+            if v_a <= 0:
+                return r"$\beta\!\in\![0,10^{%d}]$" % int(round(np.log10(v_b)))
             return r"$\beta\!\in\![10^{%d},10^{%d}]$" % (
                 int(round(np.log10(v_a))), int(round(np.log10(v_b))))
         if sym == "theta":
@@ -168,6 +177,14 @@ def fig_frontier():
         b = f[f.method == m]
         if b.empty:
             continue
+        if m == "earliest_k":
+            # Committees have N=4,9,10.  Keep only k values represented by
+            # every dataset in this cross-dataset average; larger k values
+            # remain in the CSV for per-dataset analysis but must not be mixed
+            # into a curve whose dataset composition changes with k.
+            coverage = b.groupby("sweep")["dataset"].nunique()
+            common = coverage[coverage == b["dataset"].nunique()].index
+            b = b[b["sweep"].isin(common)]
         # 3-dataset average per knob value
         g = (b.groupby("sweep")
              .agg(acc=("accuracy", "mean"), lat=("latency_mean", "mean"))

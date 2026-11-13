@@ -108,7 +108,8 @@ DEFAULT_METHODS = [
 ]
 
 ABLATION_METHODS = ["awf", "awf_no_delay", "awf_no_reliability",
-                    "awf_no_arrival"]
+                    "awf_accuracy_only", "awf_no_arrival",
+                    "awf_no_margin"]
 
 USER_SCALE_METHODS = [
     "mean", "logpool", "deadline_partial", "fastest_only",
@@ -133,6 +134,8 @@ def run_one(method: str, seed: int, dataset: str, preset: str,
             hop_mean_ms: float = 6.0,
             hop_spike_p: float = 0.10,
             hop_spike_mult: float = 5.0,
+            calibrated: bool = True,
+            split: str = "test",
             ) -> Tuple[List, np.ndarray, np.ndarray, int]:
     """Run one method for one (dataset, preset, seed). Returns trial-level data."""
     rng = np.random.RandomState(seed)
@@ -147,7 +150,9 @@ def run_one(method: str, seed: int, dataset: str, preset: str,
     # Trial cube (deterministic given seed, dataset, n_users) ---------------
     P_cube, y_true = bcinet_data.align_test_trials(sub_users, rng,
                                                    n_trials=n_trials,
-                                                   rho_err=rho_err)
+                                                   rho_err=rho_err,
+                                                   calibrated=calibrated,
+                                                   split=split)
     n_trials_actual = P_cube.shape[1]
 
     # Per-seed network assignment: each seed defines one fixed deployment
