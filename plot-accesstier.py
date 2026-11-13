@@ -47,7 +47,7 @@ METHOD_LABEL = {"weighted": "Full-Wait (linear)", "fastest_only": "First-Arrival
                 "deadline_partial": "DeadlinePartial", "awf": "AWF",
                 "oracle": "Oracle", "reliability_weighted": "Rel-Weighted",
                 "neurobci_sc": "Full-wait SC", "deadline_aware": "Arrival-Only",
-                "generic_voi": "Entropy-Gain", "logpool": "Full-Wait (log)"}
+                "generic_voi": "Entropy-Gain", "logpool": "Full-Wait"}
 CLR = {"awf": "#d1495b", "anytime_cbci": "#e8a33d", "earliest_k:3": "#3fa34d",
        "weighted": "#6c757d", "fastest_only": "#e8a33d", "oracle": "#8134af",
        "neurobci_sc": "#1b998b", "deadline_aware": "#5c4d7d",
@@ -339,6 +339,9 @@ def fig_mobility():
 
 #: hyperparameter-sensitivity palette.
 _SWEEP_CLR = "#1f4e79"  # unified sweep-line color
+# Saturated single-hue navy gradient.  The range stays visually cohesive but
+# has enough contrast to avoid the washed-out look of a pale gradient.
+_SWEEP_BAR_COLORS = ["#8FAECC", "#7194B8", "#537AA3", "#365F8C", "#1F456E"]
 _AX_LABEL_FS = 22      # axis-label font size (unified across sweep figures)
 _TICK_FS = 17          # tick-label font size
 
@@ -375,20 +378,53 @@ def _sweep_pair(g, xlabel, stem):
                       figsize=(7.8, 3.9), label_fs=18)
 
 
+def _sweep_bar_metric_fig(x, y, xlabel, ylabel, fname,
+                          ylim_pad=(0.10, 0.18)):
+    """Clean categorical bar chart shared by alpha and lambda sweeps."""
+    labels = [r"$10^{%d}$" % int(np.round(np.log10(v))) for v in x]
+    positions = np.arange(len(x))
+    colors = [_SWEEP_BAR_COLORS[i % len(_SWEEP_BAR_COLORS)]
+              for i in range(len(x))]
+
+    fig, ax = plt.subplots(figsize=(7.8, 3.9))
+    ax.bar(positions, y, width=0.68, color=colors, hatch="//",
+           edgecolor="#18364F", linewidth=1.15, zorder=3)
+
+    low = float(np.min(y))
+    high = float(np.max(y))
+    span = max(high - low, 0.25)
+    ax.set_ylim(low - ylim_pad[0] * span, high + ylim_pad[1] * span)
+    ax.set_xticks(positions, labels)
+    ax.set_xlabel(xlabel, fontsize=18)
+    ax.set_ylabel(ylabel, fontsize=18)
+    ax.tick_params(axis="x", labelsize=14)
+    ax.tick_params(axis="y", labelsize=_TICK_FS)
+    ax.grid(axis="y", alpha=0.22, zorder=0)
+    ax.grid(axis="x", visible=False)
+    fig.tight_layout()
+    _save(fig, fname)
+
+
 def fig_alpha():
     a = _load("table-alpha.csv")
     ga = a.groupby("alpha").agg(
-        acc=("accuracy", "mean"), acc_sem=("accuracy", "sem"),
-        lat=("latency_mean", "mean"), lat_sem=("latency_mean", "sem"))
-    _sweep_pair(ga, r"$\alpha$", "alpha")
+        acc=("accuracy", "mean"), lat=("latency_mean", "mean"))
+    x = ga.index.to_numpy(dtype=float)
+    _sweep_bar_metric_fig(x, ga["acc"].to_numpy() * 100.0, r"$\alpha$",
+                          "accuracy (%)", "fig-at-alpha-acc.png")
+    _sweep_bar_metric_fig(x, ga["lat"].to_numpy(), r"$\alpha$",
+                          "decision latency (ms)", "fig-at-alpha-lat.png")
 
 
 def fig_lambda():
     f = _load("table-lambda.csv")
     gl = f.groupby("lambda").agg(
-        acc=("accuracy", "mean"), acc_sem=("accuracy", "sem"),
-        lat=("latency_mean", "mean"), lat_sem=("latency_mean", "sem"))
-    _sweep_pair(gl, r"$\lambda$", "lambda")
+        acc=("accuracy", "mean"), lat=("latency_mean", "mean"))
+    x = gl.index.to_numpy(dtype=float)
+    _sweep_bar_metric_fig(x, gl["acc"].to_numpy() * 100.0, r"$\lambda$",
+                          "accuracy (%)", "fig-at-lambda-acc.png")
+    _sweep_bar_metric_fig(x, gl["lat"].to_numpy(), r"$\lambda$",
+                          "decision latency (ms)", "fig-at-lambda-lat.png")
 
 
 def main():

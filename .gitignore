@@ -50,3 +50,13 @@ results/network-dataset-analysis/*
 !results/network-dataset-analysis/professor-network-dataset-report.md
 !results/network-dataset-analysis/professor-report-easy-ko.md
 !results/network-dataset-analysis/end-to-end-delay-loss-report-ko.md
+
+# Paper-ready sensitivity and deadline figures
+!results/accesstier/
+results/accesstier/*
+!results/accesstier/fig-at-alpha-acc.png
+!results/accesstier/fig-at-alpha-lat.png
+!results/accesstier/fig-at-lambda-acc.png
+!results/accesstier/fig-at-lambda-lat.png
+!results/accesstier/fig-at-deadline-acc.png
+!results/accesstier/fig-at-deadline-lat.png
