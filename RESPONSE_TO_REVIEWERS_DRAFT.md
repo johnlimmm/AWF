@@ -193,7 +193,11 @@ accuracy/latency from 99.27%/8.98 ms to 99.50%/11.02 ms on BNCI2014_001,
 82.04%/31.30 ms on Weibo2014. The corresponding margin-stop rates decrease
 from 35.5% to 29.9%, 25.8% to 13.5%, and 10.6% to 9.7%. Thus calibration
 reduces overconfident margin stopping and makes AWF wait more conservatively;
-we do not claim a significant accuracy improvement on every dataset.
+after Holm correction across the three datasets, the accuracy change is
+significant only on Zhou2016 (`p=0.0062`; BNCI2014_001 `p=0.0868`, Weibo2014
+`p=0.6779`), whereas the latency increase is significant on all three
+(`p=0.000183`). We therefore do not claim a significant accuracy improvement
+on every dataset.
 
 ### 7. Independence built into collaborative trials
 

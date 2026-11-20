@@ -72,8 +72,10 @@ other trial and network realizations are held fixed:
 
 Thus calibration makes AWF more conservative in this campaign: it reduces
 margin-triggered early stops and increases waiting. The accuracy increase is
-largest on Zhou2016; this comparison must not be described as a universal
-accuracy improvement.
+significant after Holm correction only on Zhou2016 (`p=0.0062`; BNCI
+`p=0.0868`, Weibo `p=0.6779`). The latency increase is significant on all
+three datasets (Holm-adjusted `p=0.000183`). This comparison must not be
+described as a universal accuracy improvement.
 
 On Zhou2016, the 5-ms DP reference has mean objective 0.05758 versus AWF
 0.06042, an average gap of 0.00284. Grid sensitivity at 2.5/5/10 ms gives the
@@ -119,10 +121,16 @@ the number of users in the wait-until-all worst case.
 
 ## Reproduction
 
+The finalized local campaign is under `results/iotj-revision-submission`.
+Its manifest records commit `b61b89a`, all 11 requested experiment stages as
+complete, and `experiment_sources_dirty=false`. Twelve deterministic result
+CSVs match the preceding full run byte-for-byte; runtime is intentionally
+excluded from that equality check because it is a wall-clock measurement.
+
 ```bash
 python -m unittest -v test_revision_invariants.py
-python run-iotj-revision.py --only trace calibration tuning calibration_policy ablation dp heldout homogeneous runtime correlation deadlines
-python plot-iotj-revision.py --out-dir results/iotj-revision-final
+python run-iotj-revision.py --out-dir results/iotj-revision-submission --only trace calibration tuning calibration_policy ablation dp heldout homogeneous runtime correlation deadlines
+python plot-iotj-revision.py --out-dir results/iotj-revision-submission
 python run-accesstier.py --only frontier
 python run_replot_frontier.py
 ```
