@@ -1,13 +1,14 @@
 """Reproducible experiment driver for the IoTJ major revision.
 
 The revision results are isolated from legacy CSVs under
-``results/iotj-revision-v1``.  Policy knobs are selected on collaborative
-validation trials and then frozen for held-out test evaluation.
+``results/iotj-revision-final`` by default.  Policy knobs are selected on
+collaborative validation trials and then frozen for held-out test evaluation.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -24,9 +25,16 @@ from scipy.stats import binomtest, wilcoxon
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "results", "iotj-revision-v1")
+DEFAULT_OUT = os.path.join(HERE, "results", "iotj-revision-final")
+OUT = DEFAULT_OUT
 OBJECTIVE_LAMBDA = 1e-3
 DEADLINE_MS = 50.0
+SOURCE_FILES = [
+    "run-iotj-revision.py", "run-bcinet-experiment.py",
+    "bcinet-data.py", "bcinet-fusion.py", "bcinet-network.py",
+    "bcinet-tracebank.py", "bcinet-metrics.py",
+    "plot-iotj-revision.py", "test_revision_invariants.py",
+]
 
 # Keep MNE's mutable configuration/lock file inside the workspace.  This also
 # prevents concurrent or sandboxed revision runs from mutating the user's
@@ -66,12 +74,55 @@ def _git_head() -> str:
         return "unknown"
 
 
-def write_manifest(args: argparse.Namespace) -> None:
+def _git_dirty() -> bool | None:
+    try:
+        return bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=HERE, text=True).strip())
+    except Exception:
+        return None
+
+
+def _source_hashes() -> Dict[str, str]:
+    """Hash the experiment implementation used by this campaign."""
+    out = {}
+    for name in SOURCE_FILES:
+        path = os.path.join(HERE, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                out[name] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+
+def _experiment_sources_dirty() -> bool | None:
+    """Report changes only in files that can affect revision results."""
+    try:
+        unstaged = subprocess.call(
+            ["git", "diff", "--quiet", "--", *SOURCE_FILES], cwd=HERE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        staged = subprocess.call(
+            ["git", "diff", "--cached", "--quiet", "--", *SOURCE_FILES],
+            cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        untracked = subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "--",
+             *SOURCE_FILES], cwd=HERE, text=True,
+            stderr=subprocess.DEVNULL).strip()
+        return bool(unstaged or staged or untracked)
+    except Exception:
+        return None
+
+
+def write_manifest(args: argparse.Namespace,
+                   completed: Sequence[str]) -> None:
     os.makedirs(OUT, exist_ok=True)
+    requested = list(args.only)
     manifest = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "git_head": _git_head(),
-        "working_tree_may_be_dirty": True,
+        "git_dirty": _git_dirty(),
+        "experiment_sources_dirty": _experiment_sources_dirty(),
+        "status": "complete" if list(completed) == requested else "running",
+        "requested_experiments": requested,
+        "completed_experiments": list(completed),
         "tracebank_schema_version": TB.TRACEBANK_SCHEMA_VERSION,
         "cellular_filter": sorted(TB.CELL_LTE_MODES),
         "deadline_ms": DEADLINE_MS,
@@ -83,6 +134,7 @@ def write_manifest(args: argparse.Namespace) -> None:
         "numpy": np.__version__,
         "pandas": pd.__version__,
         "command": sys.argv,
+        "source_sha256": _source_hashes(),
     }
     with open(os.path.join(OUT, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -145,6 +197,153 @@ def experiment_calibration(datasets: Sequence[str]) -> None:
                     **vals,
                 })
     _save(pd.DataFrame(rows), "calibration-per-user.csv")
+
+
+def _safe_wilcoxon(a: Sequence[float], b: Sequence[float]) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if np.allclose(a, b, equal_nan=True):
+        return 1.0
+    try:
+        p = float(wilcoxon(a, b).pvalue)
+        return p if np.isfinite(p) else 1.0
+    except ValueError:
+        return 1.0
+
+
+def _holm_adjust(pvalues: Sequence[float]) -> np.ndarray:
+    """Holm family-wise error correction with monotonic adjusted p-values."""
+    p = np.asarray(pvalues, dtype=float)
+    order = np.argsort(p)
+    adjusted = np.empty_like(p)
+    running = 0.0
+    m = len(p)
+    for rank, idx in enumerate(order):
+        running = max(running, (m - rank) * p[idx])
+        adjusted[idx] = min(running, 1.0)
+    return adjusted
+
+
+def experiment_calibration_policy(datasets: Sequence[str], seeds: int,
+                                  n_trials: int | None) -> None:
+    """Paired raw-vs-calibrated AWF stopping-behavior comparison.
+
+    The validation-selected AWF delay weight is held fixed.  Each pair uses
+    the same collaborative-trial sampling, user-to-tier assignment, and
+    realized delay/loss samples; only the posterior calibration is changed.
+    """
+    selection_path = os.path.join(OUT, "tuned-parameters.csv")
+    if not os.path.exists(selection_path):
+        raise RuntimeError("run the tuning experiment before calibration_policy")
+    selected = pd.read_csv(selection_path)
+    seed_rows = []
+    trial_rows = []
+    reason_keys = ("margin", "neg_value", "deadline", "all_arrived")
+    for dataset in datasets:
+        users = R._ensure_users(dataset)
+        match = selected[(selected.dataset == dataset)
+                         & (selected.method == "AWF")]
+        if len(match) != 1:
+            raise RuntimeError("missing unique tuned AWF lambda for " + dataset)
+        tuned_lambda = float(match.iloc[0].control)
+        for seed in range(seeds):
+            paired = {}
+            ref_arrivals = None
+            ref_y = None
+            for variant, calibrated in (("raw", False),
+                                        ("temperature", True)):
+                result, arrivals, y, n_users = R.run_one(
+                    "awf", seed, dataset, "accesstier", users,
+                    deadline_ms=DEADLINE_MS, alpha=1e-3,
+                    lambda_delay=tuned_lambda, n_trials=n_trials,
+                    calibrated=calibrated, split="test")
+                if ref_arrivals is None:
+                    ref_arrivals = arrivals
+                    ref_y = y
+                else:
+                    if not np.array_equal(ref_arrivals, arrivals):
+                        raise AssertionError(
+                            "raw/calibrated runs did not share arrivals")
+                    if not np.array_equal(ref_y, y):
+                        raise AssertionError(
+                            "raw/calibrated runs did not share labels")
+                counts = metrics.stopping_reason_counts(result)
+                total = len(result) or 1
+                row = {
+                    "dataset": dataset, "seed": seed, "variant": variant,
+                    "tuned_lambda": tuned_lambda,
+                    "accuracy": metrics.accuracy(result, y),
+                    "latency_mean_ms": metrics.mean_decision_latency(result),
+                    "used_response_ratio": metrics.used_response_ratio(
+                        result, n_users),
+                }
+                for key in reason_keys:
+                    row[f"reason_{key}"] = counts.get(key, 0) / total
+                seed_rows.append(row)
+                paired[variant] = result
+
+            raw = paired["raw"]
+            cal = paired["temperature"]
+            for trial, (r_raw, r_cal, truth) in enumerate(
+                    zip(raw, cal, ref_y)):
+                trial_rows.append({
+                    "dataset": dataset, "seed": seed, "trial": trial,
+                    "truth": int(truth),
+                    "raw_pred": int(r_raw.pred),
+                    "temperature_pred": int(r_cal.pred),
+                    "raw_correct": int(r_raw.pred == truth),
+                    "temperature_correct": int(r_cal.pred == truth),
+                    "raw_latency_ms": r_raw.decision_time_ms,
+                    "temperature_latency_ms": r_cal.decision_time_ms,
+                    "raw_reason": r_raw.stopping_reason,
+                    "temperature_reason": r_cal.stopping_reason,
+                    "prediction_agreement": int(r_raw.pred == r_cal.pred),
+                    "stop_time_agreement": int(np.isclose(
+                        r_raw.decision_time_ms, r_cal.decision_time_ms)),
+                    "stop_reason_agreement": int(
+                        r_raw.stopping_reason == r_cal.stopping_reason),
+                })
+
+    seed_df = pd.DataFrame(seed_rows)
+    trial_df = pd.DataFrame(trial_rows)
+    _save(seed_df, "calibration-awf-seeds.csv")
+    _save(trial_df, "calibration-awf-trials.csv")
+
+    summary_rows = []
+    for dataset in datasets:
+        d = seed_df[seed_df.dataset == dataset]
+        raw = d[d.variant == "raw"].sort_values("seed")
+        cal = d[d.variant == "temperature"].sort_values("seed")
+        t = trial_df[trial_df.dataset == dataset]
+        summary_rows.append({
+            "dataset": dataset,
+            "raw_accuracy": raw.accuracy.mean(),
+            "temperature_accuracy": cal.accuracy.mean(),
+            "accuracy_delta_temperature_minus_raw": (
+                cal.accuracy.to_numpy() - raw.accuracy.to_numpy()).mean(),
+            "accuracy_wilcoxon_p": _safe_wilcoxon(
+                cal.accuracy, raw.accuracy),
+            "raw_latency_ms": raw.latency_mean_ms.mean(),
+            "temperature_latency_ms": cal.latency_mean_ms.mean(),
+            "latency_delta_temperature_minus_raw_ms": (
+                cal.latency_mean_ms.to_numpy()
+                - raw.latency_mean_ms.to_numpy()).mean(),
+            "latency_wilcoxon_p": _safe_wilcoxon(
+                cal.latency_mean_ms, raw.latency_mean_ms),
+            "raw_margin_rate": raw.reason_margin.mean(),
+            "temperature_margin_rate": cal.reason_margin.mean(),
+            "raw_neg_value_rate": raw.reason_neg_value.mean(),
+            "temperature_neg_value_rate": cal.reason_neg_value.mean(),
+            "prediction_agreement": t.prediction_agreement.mean(),
+            "stop_time_agreement": t.stop_time_agreement.mean(),
+            "stop_reason_agreement": t.stop_reason_agreement.mean(),
+        })
+    summary = pd.DataFrame(summary_rows)
+    summary["accuracy_wilcoxon_p_holm"] = _holm_adjust(
+        summary.accuracy_wilcoxon_p)
+    summary["latency_wilcoxon_p_holm"] = _holm_adjust(
+        summary.latency_wilcoxon_p)
+    _save(summary, "calibration-awf-summary.csv")
 
 
 def _candidate_grid(n_users: int) -> Dict[str, List[Tuple[str, float]]]:
@@ -268,26 +467,15 @@ def _paired_statistics(trials: pd.DataFrame) -> pd.DataFrame:
                           if discordant else 1.0)
             lat_a = awf.latency_ms.to_numpy()
             lat_b = other.latency_ms.to_numpy()
-            try:
-                p_latency = float(wilcoxon(lat_a, lat_b).pvalue)
-            except ValueError:
-                p_latency = 1.0
+            p_latency = _safe_wilcoxon(lat_a, lat_b)
             seed_a = (awf.groupby("seed")
                       .agg(accuracy=("correct", "mean"),
                            latency=("latency_ms", "mean")))
             seed_b = (other.groupby("seed")
                       .agg(accuracy=("correct", "mean"),
                            latency=("latency_ms", "mean")))
-            try:
-                p_seed_acc = float(wilcoxon(seed_a.accuracy,
-                                            seed_b.accuracy).pvalue)
-            except ValueError:
-                p_seed_acc = 1.0
-            try:
-                p_seed_lat = float(wilcoxon(seed_a.latency,
-                                            seed_b.latency).pvalue)
-            except ValueError:
-                p_seed_lat = 1.0
+            p_seed_acc = _safe_wilcoxon(seed_a.accuracy, seed_b.accuracy)
+            p_seed_lat = _safe_wilcoxon(seed_a.latency, seed_b.latency)
             rows.append({
                 "dataset": dataset, "comparison": f"AWF vs {method}",
                 "awf_only_correct": awf_only,
@@ -300,7 +488,16 @@ def _paired_statistics(trials: pd.DataFrame) -> pd.DataFrame:
                 "wilcoxon_seed_accuracy_p": p_seed_acc,
                 "wilcoxon_seed_latency_p": p_seed_lat,
             })
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    for dataset in out.dataset.unique():
+        mask = out.dataset == dataset
+        out.loc[mask, "mcnemar_exact_p_holm"] = _holm_adjust(
+            out.loc[mask, "mcnemar_exact_p"])
+        out.loc[mask, "wilcoxon_seed_accuracy_p_holm"] = _holm_adjust(
+            out.loc[mask, "wilcoxon_seed_accuracy_p"])
+        out.loc[mask, "wilcoxon_seed_latency_p_holm"] = _holm_adjust(
+            out.loc[mask, "wilcoxon_seed_latency_p"])
+    return out
 
 
 def experiment_ablation(datasets: Sequence[str], seeds: int,
@@ -651,6 +848,8 @@ EXPERIMENTS = {
     "trace": lambda a: experiment_trace(),
     "calibration": lambda a: experiment_calibration(a.datasets),
     "tuning": lambda a: experiment_tuned(a.datasets, a.seeds, a.n_trials),
+    "calibration_policy": lambda a: experiment_calibration_policy(
+        a.datasets, a.seeds, a.n_trials),
     "ablation": lambda a: experiment_ablation(a.datasets, a.seeds, a.n_trials),
     "dp": lambda a: experiment_dp(a.seeds, a.n_trials),
     "heldout": lambda a: experiment_heldout(a.datasets, a.seeds, a.n_trials),
@@ -665,6 +864,7 @@ EXPERIMENTS = {
 
 
 def main() -> None:
+    global OUT
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", nargs="+", choices=EXPERIMENTS,
                         default=list(EXPERIMENTS))
@@ -672,11 +872,20 @@ def main() -> None:
                         default=list(R.DATASETS))
     parser.add_argument("--seeds", type=int, default=15)
     parser.add_argument("--n-trials", type=int, default=None)
+    parser.add_argument(
+        "--out-dir", default=os.path.relpath(DEFAULT_OUT, HERE),
+        help="result directory (relative paths are resolved from the repo root)")
     args = parser.parse_args()
-    write_manifest(args)
+    OUT = (args.out_dir if os.path.isabs(args.out_dir)
+           else os.path.join(HERE, args.out_dir))
+    OUT = os.path.abspath(OUT)
+    completed = []
+    write_manifest(args, completed)
     for name in args.only:
         print("[revision]", name, flush=True)
         EXPERIMENTS[name](args)
+        completed.append(name)
+        write_manifest(args, completed)
 
 
 if __name__ == "__main__":

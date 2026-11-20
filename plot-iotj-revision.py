@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import matplotlib.pyplot as plt
@@ -10,7 +11,8 @@ import pandas as pd
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "results", "iotj-revision-v1")
+DEFAULT_OUT = os.path.join(HERE, "results", "iotj-revision-final")
+OUT = DEFAULT_OUT
 
 POLICIES = ["First-k", "Confidence-Stop", "Anytime-cBCI", "Arrival-Only",
             "Throughput-Stop", "Entropy-Gain", "Full-Wait", "AWF"]
@@ -138,10 +140,52 @@ def calibration_figure() -> None:
     _save(fig, "fig-revision-calibration.png")
 
 
+def calibration_awf_figure() -> None:
+    """Effect of posterior calibration on AWF accuracy, latency, and stops."""
+    path = os.path.join(OUT, "calibration-awf-seeds.csv")
+    if not os.path.exists(path):
+        return
+    df = pd.read_csv(path)
+    datasets = ["BNCI2014_001", "Zhou2016", "Weibo2014"]
+    labels = ["BNCI", "Zhou", "Weibo"]
+    variants = [("raw", "Raw", "#A7A9AC"),
+                ("temperature", "Temperature-scaled", "#3D5A80")]
+    x = np.arange(len(datasets)); width = 0.36
+    fig, axes = plt.subplots(1, 3, figsize=(14.2, 4.5))
+    for i, (variant, label, color) in enumerate(variants):
+        q = (df[df.variant == variant].groupby("dataset")
+             .agg(accuracy=("accuracy", "mean"),
+                  latency=("latency_mean_ms", "mean"),
+                  margin=("reason_margin", "mean"))
+             .reindex(datasets))
+        pos = x + (i - 0.5) * width
+        axes[0].bar(pos, q.accuracy * 100.0, width,
+                    color=color, label=label)
+        axes[1].bar(pos, q.latency, width, color=color, label=label)
+        axes[2].bar(pos, q.margin * 100.0, width, color=color, label=label)
+    axes[0].set_ylabel("AWF accuracy (%)")
+    axes[1].set_ylabel("AWF decision latency (ms)")
+    axes[2].set_ylabel("margin-stop rate (%)")
+    for ax, title in zip(axes, ("(a) Accuracy", "(b) Latency",
+                                "(c) Stopping behavior")):
+        ax.set_xticks(x, labels)
+        ax.set_title(title)
+    axes[0].legend(frameon=False)
+    fig.tight_layout()
+    _save(fig, "fig-revision-calibration-awf.png")
+
+
 def main() -> None:
+    global OUT
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", default=os.path.relpath(DEFAULT_OUT, HERE))
+    args = parser.parse_args()
+    OUT = (args.out_dir if os.path.isabs(args.out_dir)
+           else os.path.join(HERE, args.out_dir))
     deadline_figure()
     tuned_tradeoff_figure()
     calibration_figure()
+    calibration_awf_figure()
 
 
 if __name__ == "__main__":

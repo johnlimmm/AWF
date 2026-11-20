@@ -12,7 +12,10 @@ validation data, (iv) adds the previously missing policy sweeps and ablations,
 homogeneous access, and correlated BCI errors, (vi) compares AWF with a
 finite-horizon Bellman solution for the small committee, and (vii) adds paired
 statistical tests and runtime/memory measurements. We have also narrowed the
-claims where the new evidence does not support a stronger conclusion.
+claims where the new evidence does not support a stronger conclusion. In
+particular, we retain the margin condition as an interpretable sufficient
+stopping certificate, but no longer present it as an independently measured
+source of performance gain.
 
 ## Associate Editor
 
@@ -79,7 +82,9 @@ We added paired seed-level Wilcoxon tests over the 15 deployment seeds and
 trial-level exact McNemar tests as a secondary analysis. The revised claims
 follow the seed-level tests. In particular, AWF and Confidence-Stop do not
 have a significant accuracy difference on any dataset. AWF latency is
-significantly lower on BNCI2014_001 and Weibo2014, but not on Zhou2016.
+significantly lower on BNCI2014_001 and Weibo2014, but not on Zhou2016. These
+conclusions are unchanged after Holm correction across the seven AWF-versus-
+baseline comparisons within each dataset.
 
 ### Broader future work
 
@@ -179,6 +184,17 @@ to 0.7890/0.0649 on BNCI2014_001, 0.5611/0.0766 to 0.5493/0.0710 on Zhou2016,
 and 1.4769/0.0919 to 1.4492/0.0811 on Weibo2014. We add the per-user CSP-LDA
 accuracy, temperature, NLL, Brier score, and ECE table/appendix.
 
+We also added the requested stopping-behavior comparison. For each paired run,
+we hold the collaborative EEG trials, user-to-access assignment, realized
+delay/loss samples, and validation-selected AWF delay weight fixed, changing
+only raw versus temperature-scaled posteriors. Calibration changes AWF
+accuracy/latency from 99.27%/8.98 ms to 99.50%/11.02 ms on BNCI2014_001,
+95.27%/22.45 ms to 96.44%/24.80 ms on Zhou2016, and 81.82%/26.96 ms to
+82.04%/31.30 ms on Weibo2014. The corresponding margin-stop rates decrease
+from 35.5% to 29.9%, 25.8% to 13.5%, and 10.6% to 9.7%. Thus calibration
+reduces overconfident margin stopping and makes AWF wait more conservatively;
+we do not claim a significant accuracy improvement on every dataset.
+
 ### 7. Independence built into collaborative trials
 
 We now state prominently that class-matched trials from different subjects
@@ -264,12 +280,43 @@ and interpret them as post-inference fusion budgets, not total MI-trial time.
 
 ### 7. Contribution of the margin stage
 
-The reviewer is correct that the submitted sensitivity indicated little
-effect. The explicit no-margin ablation gives identical accuracy and latency
-to AWF on all three datasets. The margin triggers on 9.7--29.9% of trials
-depending on dataset, but at those events the waiting-value rule would also
-stop. We therefore describe it as a sufficient safety certificate that is
-empirically redundant in this evaluation, not as a measured source of gain.
+**Response:** We agree that the submitted sensitivity result did not establish
+an independent empirical gain from the margin stage. We nevertheless retain
+the condition because it has a simple, parameter-interpretable role that is
+different from the waiting-value calculation. Let \(k^*\) and \(k^{(2)}\)
+denote the classes with the largest and second-largest fused log beliefs. If
+
+\[
+L_{k^*}(t)-L_{k^{(2)}}(t) \geq
+\log\!\left(\frac{C-1}{\alpha}\right),
+\]
+
+then every non-leading class has probability no greater than the second-ranked
+class, and therefore the normalized leading-class belief satisfies
+
+\[
+p_{k^*}(t) \geq \frac{1}{1+\alpha}.
+\]
+
+For the default \(\alpha=10^{-3}\), this is a fused-belief concentration of at
+least approximately 0.999. Thus, the margin test is an inexpensive sufficient
+stopping certificate under the calibrated-belief model; it is not a guarantee
+that the predicted class is correct, and it is not necessary for AWF to stop.
+
+We now report its observed role directly. The margin condition is recorded as
+the stopping reason in 29.9% of BNCI2014_001 trials, 13.5% of Zhou2016 trials,
+and 9.7% of Weibo2014 trials on average over 15 seeds. However, the explicit
+no-margin ablation produces exactly the same seed-level accuracy and mean
+latency in all three datasets because the waiting-value rule is already
+non-positive at the corresponding stopping events. We therefore retain the
+margin as a conservative, interpretable fast-stop condition, report its
+empirical redundancy, and remove any claim that it independently improves the
+reported accuracy--latency tradeoff.
+
+**Change in the manuscript:** We have revised the margin-stage description to
+state the above sufficient-belief bound and its limited role. We have also
+added the trigger rates and the no-margin ablation to [Table/Figure X] and
+revised the component-level claim in [Page X, Lines Y--Z].
 
 ### 8. Fig. 1 classifier mismatch
 

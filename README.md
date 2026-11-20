@@ -138,10 +138,11 @@ python plot-accesstier.py
 ```
 
 Run the isolated IoTJ revision campaign (results are written under
-`results/iotj-revision-v1/` with a manifest):
+`results/iotj-revision-final/` with a resumable manifest and source hashes):
 
 ```bash
-python run-iotj-revision.py --only trace calibration tuning ablation dp heldout homogeneous runtime
+python run-iotj-revision.py --only trace calibration tuning calibration_policy ablation dp heldout homogeneous runtime correlation deadlines
+python plot-iotj-revision.py --out-dir results/iotj-revision-final
 ```
 
 For each dataset, First-k, Confidence-Stop, Anytime-cBCI, Arrival-Only,
@@ -150,7 +151,14 @@ collaborative trials constructed only from the validation split. Every method
 minimizes the same validation objective
 `1 - accuracy + 1e-3 * mean_latency_ms`; the selected value is frozen before
 held-out test evaluation. The runner also writes trial-level paired records,
-exact McNemar tests for accuracy, and paired Wilcoxon tests for latency.
+exact McNemar tests for accuracy, paired Wilcoxon tests, and Holm-adjusted
+family-wise p-values.
+
+The `calibration_policy` experiment holds the tuned AWF parameter, EEG trial
+sampling, user-to-access assignment, and realized delay/loss samples fixed,
+then changes only raw versus validation-temperature-scaled posteriors. It
+reports AWF accuracy, latency, stopping-reason rates, and trial-level decision
+agreement.
 
 The `dp` experiment compares AWF with an exact Bellman solution of a
 time-discretized finite-horizon model on Zhou2016 (four users). The DP

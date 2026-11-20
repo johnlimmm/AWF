@@ -14,6 +14,9 @@ older trace definitions must not be quoted in the revised manuscript.
   The old 67% statement must be removed.
 - Per-user scalar temperature is fitted only on validation NLL and frozen on
   test. Raw and calibrated posteriors are both retained.
+- A paired raw-versus-temperature-scaled AWF experiment holds the EEG trials,
+  access assignment, realized delay/loss, and tuned delay weight fixed, so the
+  effect on stopping behavior is isolated.
 - Policy parameters are selected on collaborative validation trials with the
   common objective `1 - accuracy + 1e-3 * mean latency (ms)` and are frozen on
   held-out test trials.
@@ -58,14 +61,31 @@ Temperature scaling preserves accuracy and improves mean NLL/ECE:
 | Zhou2016 | 0.5611 -> 0.5493 | 0.0766 -> 0.0710 |
 | Weibo2014 | 1.4769 -> 1.4492 | 0.0919 -> 0.0811 |
 
+Temperature scaling also changes AWF's end-to-end stopping behavior when all
+other trial and network realizations are held fixed:
+
+| Dataset | AWF accuracy raw -> calibrated | Latency raw -> calibrated | Margin-stop rate raw -> calibrated |
+|---|---:|---:|---:|
+| BNCI2014_001 | 99.27% -> 99.50% | 8.98 -> 11.02 ms | 35.5% -> 29.9% |
+| Zhou2016 | 95.27% -> 96.44% | 22.45 -> 24.80 ms | 25.8% -> 13.5% |
+| Weibo2014 | 81.82% -> 82.04% | 26.96 -> 31.30 ms | 10.6% -> 9.7% |
+
+Thus calibration makes AWF more conservative in this campaign: it reduces
+margin-triggered early stops and increases waiting. The accuracy increase is
+largest on Zhou2016; this comparison must not be described as a universal
+accuracy improvement.
+
 On Zhou2016, the 5-ms DP reference has mean objective 0.05758 versus AWF
 0.06042, an average gap of 0.00284. Grid sensitivity at 2.5/5/10 ms gives the
 same accuracy on the first three seeds.
 
 The no-margin ablation produces exactly the same accuracy and latency as full
 AWF on all three datasets. The margin test changes the recorded stop reason
-but adds no empirical performance here. It must be described as a safety
-certificate rather than claimed as an independent source of gain.
+but adds no empirical performance here. It is retained as a conservative,
+interpretable sufficient stopping certificate: the configured log-belief gap
+implies a normalized top-class belief of at least \(1/(1+\alpha)\). It must not
+be claimed as an independent measured source of gain or as a guarantee of
+classification correctness.
 
 Held-out-versus-oracle mean objective differences are small (absolute mean
 approximately 0.0002--0.0015 depending on dataset and replay mode), including
@@ -101,8 +121,8 @@ the number of users in the wait-until-all worst case.
 
 ```bash
 python -m unittest -v test_revision_invariants.py
-python run-iotj-revision.py --only trace calibration tuning ablation dp heldout homogeneous runtime correlation deadlines
-python plot-iotj-revision.py
+python run-iotj-revision.py --only trace calibration tuning calibration_policy ablation dp heldout homogeneous runtime correlation deadlines
+python plot-iotj-revision.py --out-dir results/iotj-revision-final
 python run-accesstier.py --only frontier
 python run_replot_frontier.py
 ```
